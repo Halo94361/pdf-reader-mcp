@@ -697,7 +697,11 @@ fn auto_enabled(input: &ReadPdfInput) -> bool {
 }
 
 fn requires_text_extraction(input: &ReadPdfInput) -> bool {
-    auto_enabled(input)
+    // Explicit page selection delivers page_texts, which are built from the
+    // extracted text; skipping extraction would silently return empty pages.
+    let explicit_pages = input.sources.iter().any(|source| source.pages.is_some());
+    explicit_pages
+        || auto_enabled(input)
         || input.include_full_text
         || input.include_markdown
         || input.include_chunks
@@ -2443,6 +2447,24 @@ mod tests {
             ..Default::default()
         };
         assert!(!requires_text_extraction(&input));
+    }
+
+    #[test]
+    fn explicit_page_selection_requires_text_extraction() {
+        let input = ReadPdfInput {
+            auto: Some(false),
+            include_page_count: true,
+            sources: vec![ReadPdfSource {
+                path: Some("doc.pdf".into()),
+                url: None,
+                pages: Some(serde_json::json!([1])),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            requires_text_extraction(&input),
+            "page_texts are built from extracted text; explicit pages must extract"
+        );
     }
 
     #[test]
