@@ -23,9 +23,13 @@ const MAX_GEOMETRY_CHARS: usize = 250_000;
 // pathological documents fail-closed without capping ordinary large PDFs.
 const MAX_TOTAL_EXTRACTED_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_GEOMETRY_CHARS: usize = 2_000_000;
-const MAX_RAW_TEXT_PARTS: usize = 65_536;
+// Request-wide run/segment backstops: 128x the per-page cap, matching the
+// byte backstop's "~1000 pages of average density" intent. The earlier 65,536
+// value (8x) rejected ordinary dense multi-page documents (datasheets,
+// manuals) whose per-page run counts stay well under the per-page cap.
+const MAX_RAW_TEXT_PARTS: usize = 1_048_576;
 const MAX_RAW_TEXT_PARTS_PER_PAGE: usize = 8_192;
-const MAX_NORMALIZED_TEXT_SEGMENTS: usize = 65_536;
+const MAX_NORMALIZED_TEXT_SEGMENTS: usize = 1_048_576;
 const MAX_NORMALIZED_TEXT_SEGMENTS_PER_PAGE: usize = 8_192;
 const TEXT_SEGMENT_GAP_THRESHOLD: f64 = 48.0;
 
@@ -600,15 +604,15 @@ fn normalize_page_text_parts(
         let y = part.y.ok_or_else(|| {
             TextIndexError::extraction_failed("selectable text contains a missing Y coordinate")
         })?;
+        // Runs with a zero/negative or non-finite advance (mirrored text,
+        // degenerate widths) carry no usable right edge. Clamp to a
+        // zero-width run at x instead of failing the whole extraction —
+        // row grouping and gap detection only need a consistent edge.
         let right = part
             .right
             .or_else(|| part.item.bounding_box.map(|box_| box_.right))
             .filter(|value| value.is_finite() && *value >= x)
-            .ok_or_else(|| {
-                TextIndexError::extraction_failed(
-                    "selectable text contains an invalid horizontal advance",
-                )
-            })?;
+            .unwrap_or(x);
         let key = normalized_row_key(y)?;
         let mut part = part;
         part.x = Some(x);
@@ -1965,6 +1969,81 @@ mod tests {
         std::fs::write(&path, multi_page_text_pdf(&page_texts)).expect("write PDF");
         let pages = extract_page_texts(&path, 4_000_000).expect("dense pages must extract");
         assert_eq!(pages, page_texts);
+    }
+
+    #[test]
+    fn many_moderate_run_pages_stay_under_request_wide_raw_part_backstop() {
+        // Pages of a few thousand runs each stay far below the per-page cap,
+        // but their cumulative run count exceeds the old 65,536 request-wide
+        // backstop. Dense multi-page documents (datasheets, manuals) must not
+        // be rejected for being long.
+        let page_count = 20;
+        let runs_per_page = 4_000;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("many-runs.pdf");
+        std::fs::write(
+            &path,
+            multi_run_page_pdf(page_count, runs_per_page),
+        )
+        .expect("write PDF");
+        let pages = extract_page_texts(&path, 4_000_000).expect("many moderate pages must extract");
+        assert_eq!(pages.len(), page_count);
+        assert_eq!(pages[0].chars().count(), runs_per_page);
+    }
+
+    fn multi_run_page_pdf(page_count: usize, runs_per_page: usize) -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                (3..3 + page_count)
+                    .map(|index| format!("{index} 0 R"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                page_count
+            ),
+        ];
+        let mut contents_object = 3 + page_count;
+        let font_object = contents_object + page_count;
+        for _ in 0..page_count {
+            objects.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {font_object} 0 R >> >> /Contents {contents_object} 0 R >>"
+            ));
+            contents_object += 1;
+        }
+        let run = "(x) Tj ";
+        for _ in 0..page_count {
+            let content = format!(
+                "BT /F1 12 Tf 1 0 0 1 72 700 Tm {}{} ET",
+                run.repeat(runs_per_page - 1),
+                "(x) Tj"
+            );
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ));
+        }
+        objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string());
+        let mut pdf = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
     }
 
     #[test]

@@ -3268,7 +3268,7 @@ if (
       claim.includes(
         'exact 4-case immutable TS v3.0.14 LTR selectable-text segmentation subset'
       ) &&
-      claim.includes('request-wide raw-part and normalized-segment caps of 65,536') &&
+      claim.includes('request-wide raw-part and normalized-segment caps of 1,048,576') &&
       claim.includes('per-page caps of 8,192') &&
       claim.includes('exact-cap acceptance and cap-plus-one rejection') &&
       claim.includes('raw-part rejection before allocation') &&
